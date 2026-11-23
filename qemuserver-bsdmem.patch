@@ -1,0 +1,55 @@
+Subject: [PATCH] vmstatus: allow guest-pushed memory stats for guests without
+ a balloon stats virtqueue (FreeBSD / OPNsense / pfSense)
+
+PVE derives a VM's memory usage solely from the virtio-balloon stats
+virtqueue (QemuServer.pm, ballooncb).  FreeBSD's vtballoon(4) attaches the
+balloon device but never negotiates VIRTIO_BALLOON_F_STATS_VQ, so
+query-balloon returns only `actual` and `max_mem`.  With total_mem/free_mem
+missing, $d->{mem} keeps the cgroup value set earlier, which equals the whole
+allocation -- the VM is permanently displayed at ~100% memory usage even
+though the guest is nearly idle.
+
+The upstream fix is freebsd-src PR #2509 ("virtio_balloon: Add memory
+statistics queue support"), which is still open, targets main only, and would
+require a custom OPNsense kernel.
+
+This patch adds a fallback: if balloon stats are absent and a fresh stats file
+has been written to /run/pve-bsdmem/<vmid>, use it.  The file is produced by
+the pve-bsdmem helper via the QEMU guest agent.  Format is a single line:
+
+    <unix_ts> <used_bytes> <free_bytes>
+
+Entries older than 60s are ignored, so if the helper or the guest agent stops,
+behaviour silently reverts to stock PVE.  No existing code path changes when
+the guest does provide balloon stats.
+
+Tested against: qemu-server 9.1.15 / pve-manager 9.2.2 (PVE 9.2.2)
+
+--- a/usr/share/perl5/PVE/QemuServer.pm
++++ b/usr/share/perl5/PVE/QemuServer.pm
+@@ -2651,7 +2651,23 @@
+         if (defined($info->{total_mem}) && defined($info->{free_mem})) {
+             $d->{mem} = $info->{total_mem} - $info->{free_mem};
+             $d->{freemem} = $info->{free_mem};
+-        }
++        } elsif (-r "/run/pve-bsdmem/$vmid") {
++            # Guest exposes no balloon stats virtqueue (FreeBSD/OPNsense), so the
++            # balloon reply carries only actual/max_mem and $d->{mem} would stay at
++            # the cgroup value (= full allocation).  Prefer stats pushed by
++            # pve-bsdmem, but only while they are fresh.
++            if (open(my $fh, '<', "/run/pve-bsdmem/$vmid")) {
++                my $line = <$fh>;
++                close($fh);
++                if (defined($line) && $line =~ m/^(\d+)\s+(\d+)\s+(\d+)\s*$/) {
++                    my ($ts, $used, $free) = ($1, $2, $3);
++                    if ((time() - $ts) < 60) {
++                        $d->{mem} = $used;
++                        $d->{freemem} = $free;
++                        $info->{bsdmem} = 1;
++                    }
++                }
++            }
++        }
+ 
+         $d->{ballooninfo} = $info;
+     };

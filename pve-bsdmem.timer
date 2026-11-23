@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh FreeBSD guest memory stats for Proxmox
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=10
+AccuracySec=1s
+Unit=pve-bsdmem.service
+
+[Install]
+WantedBy=timers.target

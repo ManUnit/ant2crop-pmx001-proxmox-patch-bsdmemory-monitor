@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish FreeBSD guest memory stats for Proxmox
+Documentation=https://github.com/freebsd/freebsd-src/pull/2509
+After=pve-guests.service qemu-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pve-bsdmem
+Nice=10

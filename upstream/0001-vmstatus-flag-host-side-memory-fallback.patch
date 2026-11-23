@@ -1,0 +1,86 @@
+From: Your Name <you@example.com>
+Date: Mon, 23 Nov 2026 07:30:00 +0700
+Subject: [PATCH qemu-server] vmstatus: flag host-side memory fallback for
+ guests without balloon stats
+
+vmstatus() seeds $d->{mem} from the cgroup and lets the balloon callback
+override it, but the override only happens when query-balloon carries
+total_mem and free_mem:
+
+    $d->{mem} = $d->{memhost};   # default to cgroup, balloon info can override this below
+    ...
+    if (defined($info->{total_mem}) && defined($info->{free_mem})) {
+        $d->{mem} = $info->{total_mem} - $info->{free_mem};
+        $d->{freemem} = $info->{free_mem};
+    }
+
+A guest whose balloon driver does not implement the statistics virtqueue
+never supplies those. FreeBSD's vtballoon(4) is the common case - it
+attaches, but never negotiates VIRTIO_BALLOON_F_STATS_VQ - which covers
+every FreeBSD-based guest, OPNsense and pfSense included.
+
+Two guests on one host, via query-balloon:
+
+  # Ubuntu 26.04, 5 GB assigned
+  balloon: actual=5056 max_mem=5056 total_mem=4335 free_mem=3342 \
+           ... last_update=1795323645
+
+  # OPNsense 26.7 (FreeBSD 15.1-RELEASE-p1), 20 GB assigned
+  balloon: actual=20480 max_mem=20480
+
+For the second, 'mem' silently stays at the cgroup figure, so the guest is
+reported as using its full allocation forever. Because that figure includes
+QEMU's own overhead it can exceed maxmem - observed 100.23% of a 4 GiB VM -
+while the guest itself reported under 1 GB in use. The UI has no way to tell
+this apart from a genuine out-of-memory situation and renders it critical.
+
+Nothing can be done about the missing data here; the fix belongs in the guest
+driver, and one is pending upstream [1]. But 'mem' being a host-side estimate
+rather than a guest measurement is knowable, so record it instead of letting
+consumers guess. No existing behaviour changes: the new field is only set on
+the path that was already falling back.
+
+A follow-up in pve-manager can then label the value and skip the critical
+threshold for it.
+
+[1] https://github.com/freebsd/freebsd-src/pull/2509
+    "virtio_balloon: Add memory statistics queue support"
+
+Signed-off-by: Your Name <you@example.com>
+---
+ PVE/QemuServer.pm | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+--- a/PVE/QemuServer.pm
++++ b/PVE/QemuServer.pm
+@@ -2355,6 +2355,15 @@
+         optional => 1,
+         renderer => 'bytes',
+     },
++    memfallback => {
++        description => "Set when 'mem' could not be obtained from the guest and falls back"
++            . " to the host-side figure, because the guest's balloon driver does not"
++            . " implement the statistics virtqueue. Such a value includes QEMU's own"
++            . " overhead and may exceed 'maxmem'; it should not be presented as guest"
++            . " memory usage.",
++        type => 'boolean',
++        optional => 1,
++    },
+     maxdisk => {
+         description => "Root disk size in bytes.",
+         type => 'integer',
+@@ -2651,6 +2660,14 @@
+         if (defined($info->{total_mem}) && defined($info->{free_mem})) {
+             $d->{mem} = $info->{total_mem} - $info->{free_mem};
+             $d->{freemem} = $info->{free_mem};
++        } else {
++            # The guest's balloon driver does not implement the statistics
++            # virtqueue - FreeBSD's vtballoon(4) attaches but never negotiates
++            # VIRTIO_BALLOON_F_STATS_VQ - so query-balloon carries only actual
++            # and max_mem, and $d->{mem} keeps the cgroup value set above.
++            # That is a host-side figure including QEMU's own overhead, which
++            # can push it past maxmem; let consumers tell the two apart.
++            $d->{memfallback} = 1;
+         }
+
+         $d->{ballooninfo} = $info;

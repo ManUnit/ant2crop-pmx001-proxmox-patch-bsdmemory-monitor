@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""pve-bsdmem - publish real guest memory of FreeBSD-based VMs to Proxmox.
+
+FreeBSD's vtballoon(4) never negotiates VIRTIO_BALLOON_F_STATS_VQ, so PVE
+falls back to the cgroup value and shows the VM pinned at ~100% memory.
+This helper asks the guest over the QEMU guest agent and writes
+
+    <unix_ts> <used_bytes> <free_bytes>
+
+to /run/pve-bsdmem/<vmid>, which the patched QemuServer.pm picks up.
+
+"free" follows the semantics proposed in freebsd-src PR #2509: free pages plus
+inactive pages, i.e. memory the guest can hand out without swapping.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+CONF = "/etc/pve-bsdmem.conf"
+RUNDIR = "/run/pve-bsdmem"
+STALE_AFTER = 60
+
+# order matters - parsed positionally below
+SYSCTLS = [
+    "hw.pagesize",
+    "vm.stats.vm.v_page_count",
+    "vm.stats.vm.v_free_count",
+    "vm.stats.vm.v_inactive_count",
+]
+
+
+def version():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "VERSION"),
+                 "/usr/local/share/pve-bsdmem/VERSION"):
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError:
+            continue
+    return "unknown"
+
+
+def configured_vmids():
+    ids = []
+    try:
+        with open(CONF) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line.isdigit():
+                    ids.append(int(line))
+    except FileNotFoundError:
+        pass
+    return ids
+
+
+def guest_sysctl(vmid):
+    """Run sysctl inside the guest via the QEMU guest agent."""
+    cmd = [
+        "qm", "guest", "exec", str(vmid), "--timeout", "5",
+        "--", "/sbin/sysctl", "-n",
+    ] + SYSCTLS
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    if proc.returncode != 0:
+        return None
+    try:
+        res = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if res.get("exitcode") != 0:
+        return None
+    try:
+        vals = [int(tok) for tok in res.get("out-data", "").split()]
+    except ValueError:
+        return None
+    return vals if len(vals) == len(SYSCTLS) else None
+
+
+def publish(vmid, used, free):
+    fd, tmp = tempfile.mkstemp(dir=RUNDIR)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("%d %d %d\n" % (int(time.time()), used, free))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(RUNDIR, str(vmid)))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main():
+    if "--version" in sys.argv[1:]:
+        print("pve-bsdmem %s" % version())
+        return 0
+
+    vmids = configured_vmids()
+    if not vmids:
+        print("no VMIDs configured in %s" % CONF, file=sys.stderr)
+        return 0
+
+    os.makedirs(RUNDIR, exist_ok=True)
+    rc = 0
+    for vmid in vmids:
+        try:
+            vals = guest_sysctl(vmid)
+        except (subprocess.TimeoutExpired, OSError) as err:
+            print("vm %d: %s" % (vmid, err), file=sys.stderr)
+            rc = 1
+            continue
+        if not vals:
+            # agent missing or not answering - leave the file to go stale so
+            # QemuServer.pm reverts to stock behaviour on its own
+            print("vm %d: no usable guest agent reply" % vmid, file=sys.stderr)
+            rc = 1
+            continue
+
+        pagesize, total_pg, free_pg, inactive_pg = vals
+        total = total_pg * pagesize
+        free = (free_pg + inactive_pg) * pagesize
+        used = max(total - free, 0)
+        publish(vmid, used, free)
+
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

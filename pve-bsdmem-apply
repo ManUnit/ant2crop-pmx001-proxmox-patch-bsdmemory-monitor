@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Apply, probe or revert the pve-bsdmem fallback in PVE's QemuServer.pm.
+
+Does not need patch(1) - PVE nodes on an isolated mgmt segment often have
+neither the binary nor a way to apt-install it.  The edit is anchored on the
+balloon-stats branch inside ballooncb() and is idempotent: running it twice is
+a no-op, and it refuses to touch the file if upstream has changed that branch.
+
+  pve-bsdmem-apply [MODE] [path]
+
+  (no mode)   apply the fallback
+  --check     is it currently patched?        exit 0 = yes, 1 = no
+  --probe     is the anchor still present?    exit 0 = compatible, 2 = not
+  --revert    restore from the backup
+  --version   print version
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+TARGET = "/usr/share/perl5/PVE/QemuServer.pm"
+MARKER = "pve-bsdmem"
+ANCHOR = "if (defined($info->{total_mem}) && defined($info->{free_mem})) {"
+
+NEW_BRANCH = """\
+{i}}} elsif (-r "/run/{marker}/$vmid") {{
+{i}    # Guest exposes no balloon stats virtqueue (FreeBSD/OPNsense), so the
+{i}    # balloon reply carries only actual/max_mem and $d->{{mem}} would stay at
+{i}    # the cgroup value (= full allocation).  Prefer stats pushed by
+{i}    # {marker}, but only while they are fresh.
+{i}    if (open(my $fh, '<', "/run/{marker}/$vmid")) {{
+{i}        my $line = <$fh>;
+{i}        close($fh);
+{i}        if (defined($line) && $line =~ m/^(\\d+)\\s+(\\d+)\\s+(\\d+)\\s*$/) {{
+{i}            my ($ts, $used, $free) = ($1, $2, $3);
+{i}            if ((time() - $ts) < 60) {{
+{i}                $d->{{mem}} = $used;
+{i}                $d->{{freemem}} = $free;
+{i}                $info->{{bsdmem}} = 1;
+{i}            }}
+{i}        }}
+{i}    }}
+{i}}}
+"""
+
+
+def version():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "VERSION"),
+                 "/usr/local/share/pve-bsdmem/VERSION"):
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError:
+            continue
+    return "unknown"
+
+
+def perl_check(path, quiet=False):
+    """Syntax-check with perl. Returns None when perl is unavailable."""
+    if not shutil.which("perl"):
+        return None
+    out = subprocess.DEVNULL if quiet else None
+    return subprocess.run(["perl", "-c", path], stdout=out, stderr=out).returncode
+
+
+def locate(lines):
+    """Return (anchor_idx, close_idx, indent) for the balloon-stats branch."""
+    hits = [n for n, ln in enumerate(lines) if ln.strip() == ANCHOR]
+    if len(hits) != 1:
+        raise SystemExit(
+            "refusing to edit: expected exactly 1 anchor, found %d.\n"
+            "Upstream ballooncb() changed - review the patch before retrying."
+            % len(hits))
+    idx = hits[0]
+    indent = re.match(r"[ \t]*", lines[idx]).group(0)
+    close = idx + 1
+    while close < len(lines) and lines[close] != indent + "}":
+        close += 1
+        if close - idx > 20:
+            raise SystemExit("refusing to edit: closing brace not found")
+    return idx, close, indent
+
+
+def probe(path):
+    """Report whether this QemuServer.pm is still compatible."""
+    src = open(path, encoding="utf-8").read()
+    hits = sum(1 for ln in src.split("\n") if ln.strip() == ANCHOR)
+    patched = MARKER in src
+    print("target:  %s" % path)
+    print("anchor:  %s (%d occurrence%s)"
+          % ("found" if hits == 1 else "NOT USABLE", hits,
+             "" if hits == 1 else "s"))
+    print("patched: %s" % ("yes" if patched else "no"))
+    if hits != 1:
+        print("\nUpstream changed ballooncb(); this release cannot patch it.",
+              file=sys.stderr)
+        return 2
+    return 0
+
+
+def apply(path):
+    src = open(path, encoding="utf-8").read()
+    if MARKER in src:
+        print("already applied")
+        return 0
+
+    lines = src.split("\n")
+    idx, close, indent = locate(lines)
+
+    # Baseline first: perl -c also fails when a PVE dependency is missing (e.g.
+    # when testing a copy off-node), which must not be mistaken for our edit
+    # breaking the file.
+    baseline = perl_check(path, quiet=True)
+    if baseline is None:
+        print("note: perl not found, syntax check skipped", file=sys.stderr)
+    elif baseline != 0:
+        print("note: %s already fails perl -c (missing deps?), "
+              "syntax check skipped" % path, file=sys.stderr)
+
+    block = NEW_BRANCH.format(i=indent, marker=MARKER).rstrip("\n").split("\n")
+    lines[close:close + 1] = block
+    out = "\n".join(lines)
+
+    shutil.copy2(path, path + ".pve-bsdmem.orig")
+    open(path, "w", encoding="utf-8").write(out)
+
+    if baseline == 0 and perl_check(path) != 0:
+        shutil.copy2(path + ".pve-bsdmem.orig", path)
+        raise SystemExit("perl -c failed after edit, reverted. nothing changed.")
+
+    print("applied at line %d, backup: %s.pve-bsdmem.orig" % (close + 1, path))
+    return 0
+
+
+def revert(path):
+    backup = path + ".pve-bsdmem.orig"
+    if os.path.exists(backup):
+        shutil.copy2(backup, path)
+        os.unlink(backup)
+        print("restored from backup")
+    elif MARKER in open(path, encoding="utf-8").read():
+        raise SystemExit("no backup found; run: apt install --reinstall qemu-server")
+    else:
+        print("not patched")
+    if perl_check(path, quiet=True) not in (0, None):
+        print("note: restored file does not pass perl -c here "
+              "(missing deps off-node?)", file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    mode, path = "apply", TARGET
+    for arg in argv[1:]:
+        if arg in ("--check", "--revert", "--probe", "--version"):
+            mode = arg.lstrip("-")
+        elif arg in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            path = arg
+
+    if mode == "version":
+        print("pve-bsdmem %s" % version())
+        return 0
+
+    if not os.path.isfile(path):
+        raise SystemExit("not found: %s" % path)
+
+    if mode == "check":
+        patched = MARKER in open(path, encoding="utf-8").read()
+        print("patched" if patched else "not patched")
+        return 0 if patched else 1
+    if mode == "probe":
+        return probe(path)
+    if mode == "revert":
+        return revert(path)
+    return apply(path)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,2 @@
+// Re-apply the pve-bsdmem fallback whenever qemu-server is upgraded.
+DPkg::Post-Invoke { "/usr/local/sbin/pve-bsdmem-reapply || true"; };

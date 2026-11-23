@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Re-apply the QemuServer.pm fallback after a qemu-server package upgrade.
+# Wired in via /etc/apt/apt.conf.d/99-pve-bsdmem.
+set -e
+
+TARGET=/usr/share/perl5/PVE/QemuServer.pm
+APPLY=/usr/local/sbin/pve-bsdmem-apply
+
+[ -f "$TARGET" ] || exit 0
+[ -x "$APPLY" ] || exit 0
+
+# nothing to do if still patched
+if "$APPLY" --check "$TARGET" >/dev/null 2>&1; then
+    exit 0
+fi
+
+echo "pve-bsdmem: QemuServer.pm was replaced, re-applying fallback"
+if "$APPLY" "$TARGET"; then
+    # pvedaemon/pveproxy cache QemuServer.pm too - restarting pvestatd alone
+    # fixes the graph but leaves the VM Summary panel on the stale value
+    systemctl restart pvestatd pvedaemon pveproxy || true
+else
+    echo "pve-bsdmem: WARNING - could not re-apply; PVE reverts to stock" >&2
+    echo "pve-bsdmem: review ballooncb() in $TARGET and refresh the patch" >&2
+fi
